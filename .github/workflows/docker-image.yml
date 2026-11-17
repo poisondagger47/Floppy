@@ -33,8 +33,7 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: dannyvfilms/floppy
-  LEGACY_IMAGE_NAME: dannyvfilms/yamtrack
+  IMAGE_NAME: poisondagger47/floppy
 
 jobs:
   quality:
@@ -318,7 +317,6 @@ jobs:
           # updates. Drop the second line once traffic to it has died off.
           images: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-            ${{ env.REGISTRY }}/${{ env.LEGACY_IMAGE_NAME }}
           tags: |
             type=ref,event=pr
             type=semver,pattern={{version}}
@@ -403,7 +401,7 @@ jobs:
         run: |
           set -euo pipefail
           test -n "$DIGEST"
-          for image in "$REGISTRY/$IMAGE_NAME" "$REGISTRY/$LEGACY_IMAGE_NAME"; do
+          for image in "$REGISTRY/$IMAGE_NAME"; do
             python3 scripts/verify_image_attestations.py "$image" "$DIGEST"
           done
 
@@ -413,7 +411,7 @@ jobs:
           # Policy lives in .trivyignore.yaml (reviewed exceptions only).
           # --exit-code 1 fails on HIGH/CRITICAL with an available fix; scanner
           # or DB errors also exit nonzero.
-          for image in "$REGISTRY/$IMAGE_NAME" "$REGISTRY/$LEGACY_IMAGE_NAME"; do
+          for image in "$REGISTRY/$IMAGE_NAME"; do
             for platform in linux/amd64 linux/arm64; do
               echo "::group::$image $platform"
               docker run --rm \
