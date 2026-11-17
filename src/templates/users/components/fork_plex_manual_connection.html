@@ -1,0 +1,203 @@
+{% load i18n ui_tags %}
+<div class="ui-section-stack"
+     x-data="{
+       authUrl: '',
+       pinState: 'idle',
+       pinError: '',
+       copied: false,
+       showToken: false,
+       tokenValue: '',
+       pollTimer: null,
+       stopPolling() {
+         if (this.pollTimer) {
+           clearInterval(this.pollTimer);
+           this.pollTimer = null;
+         }
+       },
+       async startLoginLink() {
+         this.stopPolling();
+         this.pinState = 'starting';
+         this.pinError = '';
+         this.copied = false;
+         try {
+           const csrfInput = this.$el.querySelector('input[name=csrfmiddlewaretoken]');
+           const csrf = csrfInput ? csrfInput.value : '';
+           const resp = await fetch('{% url 'fork_plex_manual_pin_start' %}', {
+             method: 'POST',
+             credentials: 'same-origin',
+             headers: {
+               'X-CSRFToken': csrf,
+               'Accept': 'application/json'
+             }
+           });
+           const data = await resp.json().catch(() => ({}));
+           if (!resp.ok || !data.authUrl) {
+             this.pinState = 'error';
+             this.pinError = data.detail || 'Could not generate Plex login link.';
+             return;
+           }
+           this.authUrl = data.authUrl;
+           this.pinState = 'pending';
+           this.pollTimer = setInterval(() => this.checkLoginStatus(), 3000);
+         } catch (err) {
+           this.pinState = 'error';
+           this.pinError = err?.message || 'Could not contact Floppy server.';
+         }
+       },
+       async checkLoginStatus() {
+         if (this.pinState !== 'pending') return;
+         try {
+           const resp = await fetch('{% url 'fork_plex_manual_pin_poll' %}', {
+             method: 'GET',
+             credentials: 'same-origin',
+             headers: { 'Accept': 'application/json' }
+           });
+           const data = await resp.json().catch(() => ({}));
+           if (data.status === 'authorized' && data.token) {
+             this.stopPolling();
+             this.tokenValue = data.token;
+             this.pinState = 'authorized';
+           } else if (data.status === 'error') {
+             this.stopPolling();
+             this.pinState = 'error';
+             this.pinError = data.detail || 'Error checking Plex login status.';
+           }
+         } catch (_err) {
+           /* transient network hiccup; next interval will retry */
+         }
+       },
+       async copyAuthUrl() {
+         if (!this.authUrl) return;
+         try {
+           await navigator.clipboard.writeText(this.authUrl);
+           this.copied = true;
+           setTimeout(() => { this.copied = false; }, 2000);
+         } catch (_err) {
+           this.copied = false;
+         }
+       }
+     }">
+  <div class="ui-card-grid ui-card-grid-start">
+    {% translate "Manual Plex connection (URL / Token)" as manual_title %}
+    {% if plex_connected and plex_account.section_settings.fork_plex_server_url %}
+      {% translate "Direct URL active" as manual_badge %}
+      {% firstof "success" as manual_tone %}
+    {% elif plex_connected %}
+      {% translate "Token active" as manual_badge %}
+      {% firstof "info" as manual_tone %}
+    {% else %}
+      {% translate "Manual setup" as manual_badge %}
+      {% firstof "neutral" as manual_tone %}
+    {% endif %}
+
+    {% settings_card title=manual_title tone=manual_tone badge=manual_badge %}
+      <p>{% translate "Connect Plex directly with an optional Server URL and an X-Plex-Token, or generate a copyable app.plex.tv sign-in link that works in any browser without callback redirects." %}</p>
+
+      {% if plex_connected %}
+        <div class="ui-account-summary">
+          <p class="provider-small">
+            {% translate "Connected as:" %} <strong>{{ plex_account.plex_username }}</strong>
+            {% if plex_account.section_settings.fork_plex_server_url %}
+              • {% translate "Direct Server:" %} <code>{{ plex_account.section_settings.fork_plex_server_url }}</code>
+            {% else %}
+              • {% translate "Discovery: plex.tv" %}
+            {% endif %}
+          </p>
+        </div>
+      {% endif %}
+
+      <div class="ui-guide-primary">
+        <span class="ui-guide-primary-label">{% translate "Option 1: Generate copyable Plex login URL" %}</span>
+        <div class="ui-copy-value">
+          <button type="button"
+                  class="ui-button ui-button-secondary"
+                  :disabled="pinState === 'starting'"
+                  @click="startLoginLink()">
+            <span x-text="pinState === 'starting' ? '{% translate "Generating…" %}' : (authUrl ? '{% translate "Regenerate Login Link" %}' : '{% translate "Generate Plex Login Link" %}')">
+              {% translate "Generate Plex Login Link" %}
+            </span>
+          </button>
+          <button type="button"
+                  x-cloak
+                  x-show="pinState === 'pending'"
+                  class="ui-button ui-button-secondary"
+                  @click="checkLoginStatus()">
+            {% translate "Check Status" %}
+          </button>
+        </div>
+
+        <div x-cloak x-show="authUrl" class="ui-guide-stack">
+          <div class="ui-copy-value">
+            <code x-text="authUrl"></code>
+            <button type="button"
+                    class="ui-button ui-button-secondary"
+                    @click="copyAuthUrl()">
+              <span x-text="copied ? '{% translate "Copied!" %}' : '{% translate "Copy URL" %}'">{% translate "Copy URL" %}</span>
+            </button>
+            <a class="ui-button"
+               :href="authUrl"
+               target="_blank"
+               rel="noopener noreferrer">
+              {% translate "Open Login URL" %}
+            </a>
+          </div>
+          <p x-show="pinState === 'pending'" class="provider-small">
+            {% translate "Waiting for sign-in on app.plex.tv… Once you approve in your browser, your X-Plex-Token will auto-fill below." %}
+          </p>
+          <p x-show="pinState === 'authorized'" class="provider-small" style="color: var(--color-success-text);">
+            {% translate "Plex login approved! Your X-Plex-Token has been filled in below — click Save Connection to finish." %}
+          </p>
+        </div>
+
+        <p x-cloak x-show="pinError" class="provider-small" role="alert" style="color: var(--color-error-text);" x-text="pinError"></p>
+      </div>
+
+      <form class="ui-form" method="post" action="{% url 'fork_plex_manual_connect' %}">
+        {% csrf_token %}
+        <input type="hidden" name="next" value="{{ request.get_full_path }}">
+
+        <div class="ui-field">
+          <label for="fork-plex-server-url">{% translate "Plex Server / Login URL (optional)" %}</label>
+          <input id="fork-plex-server-url"
+                 name="server_url"
+                 type="text"
+                 autocomplete="off"
+                 placeholder="http://192.168.1.50:32400 or https://plex.example.com"
+                 value="{{ plex_account.section_settings.fork_plex_server_url|default:'' }}">
+          <p class="ui-field-help">
+            {% translate "Enter your direct Plex URL (or paste your Plex Web URL) to connect directly to your server. Leave blank to discover servers via plex.tv." %}
+          </p>
+        </div>
+
+        <div class="ui-field">
+          <label for="fork-plex-token">{% translate "Plex Token (X-Plex-Token)" %}</label>
+          <input id="fork-plex-token"
+                 name="plex_token"
+                 x-model="tokenValue"
+                 :type="showToken ? 'text' : 'password'"
+                 autocomplete="off"
+                 placeholder="{% if plex_connected %}{% translate 'Saved — leave blank to keep current token, or enter a new one' %}{% else %}{% translate 'Paste X-Plex-Token or use Generate Plex Login Link above' %}{% endif %}"
+                 {% if not plex_connected %}required{% endif %}>
+          <div class="ui-copy-value">
+            <button type="button"
+                    class="ui-button ui-button-secondary"
+                    @click="showToken = !showToken">
+              <span x-text="showToken ? '{% translate "Hide Token" %}' : '{% translate "Show Token" %}'">{% translate "Show Token" %}</span>
+            </button>
+            <span class="ui-field-help">
+              {% translate "In Plex Web: open any media item → ⋯ → Get Info → View XML → copy X-Plex-Token from the URL." %}
+            </span>
+          </div>
+        </div>
+
+        <button class="ui-button" type="submit">
+          {% if plex_connected %}
+            {% translate "Save Manual Plex Connection" %}
+          {% else %}
+            {% translate "Connect Plex with URL / Token" %}
+          {% endif %}
+        </button>
+      </form>
+    {% endsettings_card %}
+  </div>
+</div>

@@ -866,3 +866,11 @@ def _raise_for_auth(response: requests.Response):
         raise PlexClientError(
             msg,
         ) from exc
+
+
+import sys as _sys  # noqa: E402
+from integrations.fork_plex_manual import (  # noqa: E402
+    install_plex_overrides as _install_plex_overrides,
+)
+
+_install_plex_overrides(_sys.modules[__name__])
