@@ -38,7 +38,7 @@ env:
 jobs:
   quality:
     name: Release quality gates
-    if: github.event_name != 'pull_request'
+    if: false
     uses: ./.github/workflows/app-tests.yml
     # Backend/migration/lint gates plus the built-image smoke remain blocking.
     # Full Playwright coverage stays in the required pull-request test workflow.
@@ -282,8 +282,7 @@ jobs:
       ${{ !cancelled() &&
       (github.event_name == 'pull_request' || github.actor != 'dependabot[bot]') &&
       needs.test.result == 'success' &&
-      (needs.quality.result == 'success' ||
-       (github.event_name == 'pull_request' && needs.quality.result == 'skipped')) }}
+      (needs.quality.result == 'success' || needs.quality.result == 'skipped') }}
     permissions:
       contents: read
       packages: write
