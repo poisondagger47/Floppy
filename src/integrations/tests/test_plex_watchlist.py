@@ -8,7 +8,19 @@ from django.urls import reverse
 from django.utils import timezone
 from django_celery_beat.models import IntervalSchedule, PeriodicTask
 
-from app.models import TV, Item, ItemTag, MediaTypes, Movie, Sources, Status, Tag
+from app.models import (
+    Episode,
+    Item,
+    ItemTag,
+    MediaTypes,
+    Movie,
+    MoviePlay,
+    Season,
+    Sources,
+    Status,
+    TV,
+    Tag,
+)
 from integrations import plex as plex_api
 from integrations.models import PlexAccount, PlexWatchlistSyncItem
 from integrations.plex_watchlist import (
@@ -146,7 +158,7 @@ class PlexWatchlistSyncServiceTests(TestCase):
             "Guid": [{"id": guid}],
         }
 
-    def _metadata_side_effect(self, media_type, media_id, source):
+    def _metadata_side_effect(self, media_type, media_id, source, *args, **kwargs):
         if media_type == MediaTypes.MOVIE.value:
             return {
                 "title": "Movie Title",
@@ -278,7 +290,7 @@ class PlexWatchlistSyncServiceTests(TestCase):
 
     @patch("integrations.plex_watchlist.services.get_media_metadata")
     @patch("integrations.plex_watchlist.plex_api.fetch_watchlist")
-    def test_removal_preserves_modified_media_and_deactivates_link(
+    def test_removal_deletes_unwatched_existing_media_even_if_modified(
         self, mock_fetch_watchlist, mock_metadata
     ):
         mock_fetch_watchlist.side_effect = [
@@ -294,9 +306,72 @@ class PlexWatchlistSyncServiceTests(TestCase):
 
         counts, _ = PlexWatchlistSyncService(self.user, self.account).sync()
 
-        self.assertEqual(Movie.objects.filter(user=self.user).count(), 1)
+        self.assertEqual(Movie.objects.filter(user=self.user).count(), 0)
         sync_item = PlexWatchlistSyncItem.objects.get(user=self.user)
         self.assertFalse(sync_item.is_active)
+        self.assertEqual(counts.get("removed", 0), 1)
+        self.assertEqual(counts.get("deactivated", 0), 0)
+
+    @patch("integrations.plex_watchlist.services.get_media_metadata")
+    @patch("integrations.plex_watchlist.plex_api.fetch_watchlist")
+    def test_removal_preserves_media_with_movie_play_history(
+        self, mock_fetch_watchlist, mock_metadata
+    ):
+        mock_fetch_watchlist.side_effect = [
+            ([self._movie_entry()], 1),
+            ([], 0),
+        ]
+        mock_metadata.side_effect = self._metadata_side_effect
+
+        PlexWatchlistSyncService(self.user, self.account).sync()
+        movie = Movie.objects.get(user=self.user)
+        MoviePlay.objects.create(movie=movie, end_date=timezone.now())
+
+        counts, _ = PlexWatchlistSyncService(self.user, self.account).sync()
+
+        self.assertTrue(Movie.objects.filter(user=self.user).exists())
+        self.assertEqual(counts.get("removed", 0), 0)
+        self.assertEqual(counts.get("deactivated", 0), 1)
+
+    @patch("integrations.plex_watchlist.services.get_media_metadata")
+    @patch("integrations.plex_watchlist.plex_api.fetch_watchlist")
+    def test_removal_preserves_show_with_episode_history(
+        self, mock_fetch_watchlist, mock_metadata
+    ):
+        mock_fetch_watchlist.side_effect = [
+            ([self._show_entry()], 1),
+            ([], 0),
+        ]
+        mock_metadata.side_effect = self._metadata_side_effect
+
+        PlexWatchlistSyncService(self.user, self.account).sync()
+        tv = TV.objects.get(user=self.user)
+        season_item = Item.objects.create(
+            media_type=MediaTypes.SEASON.value,
+            source=Sources.TMDB.value,
+            media_id=tv.item.media_id,
+            season_number=1,
+            title="Show Title Season 1",
+        )
+        season = Season.objects.create(
+            user=self.user,
+            related_tv=tv,
+            item=season_item,
+            status=Status.IN_PROGRESS.value,
+        )
+        episode_item = Item.objects.create(
+            media_type=MediaTypes.EPISODE.value,
+            source=Sources.TMDB.value,
+            media_id=tv.item.media_id,
+            season_number=1,
+            episode_number=1,
+            title="Pilot",
+        )
+        Episode.objects.create(related_season=season, item=episode_item)
+
+        counts, _ = PlexWatchlistSyncService(self.user, self.account).sync()
+
+        self.assertTrue(TV.objects.filter(user=self.user, item=tv.item).exists())
         self.assertEqual(counts.get("removed", 0), 0)
         self.assertEqual(counts.get("deactivated", 0), 1)
 

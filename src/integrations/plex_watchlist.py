@@ -9,7 +9,17 @@ from django.db import IntegrityError
 from django.utils import timezone
 
 from app.mixins import disable_fetch_releases
-from app.models import TV, Item, ItemTag, MediaTypes, Movie, Sources, Status
+from app.models import (
+    Episode,
+    Item,
+    ItemTag,
+    MediaTypes,
+    Movie,
+    MoviePlay,
+    Sources,
+    Status,
+    TV,
+)
 from app.providers import services, tmdb
 from integrations import external_references
 from integrations import plex as plex_api
@@ -482,14 +492,13 @@ class PlexWatchlistSyncService:
         now = timezone.now()
         for sync_item in stale_items:
             removed_media = False
-            if sync_item.created_by_sync:
-                media_obj = self._get_media_instance(sync_item.item)
-                if media_obj and self._can_remove_synced_media(
-                    sync_item.item, media_obj
-                ):
-                    media_obj.delete()
-                    removed_media = True
-                    self.counts["removed"] += 1
+            media_obj = self._get_media_instance(sync_item.item)
+            if media_obj and self._can_remove_unwatched_media(
+                sync_item, media_obj
+            ):
+                media_obj.delete()
+                removed_media = True
+                self.counts["removed"] += 1
 
             if not removed_media:
                 self.counts["deactivated"] += 1
@@ -510,28 +519,30 @@ class PlexWatchlistSyncService:
             return TV.objects.filter(user=self.user, item=item).first()
         return None
 
-    def _can_remove_synced_media(self, item: Item, media_obj) -> bool:
-        """Return True when a synced Planning row is safe to auto-remove."""
+    def _can_remove_unwatched_media(self, sync_item, media_obj) -> bool:
+        """Remove a watchlist-linked tracker only when it has no play history."""
+        item = sync_item.item
         if item.media_type == MediaTypes.MOVIE.value:
             if Movie.objects.filter(user=self.user, item=item).count() != 1:
+                return False
+            if MoviePlay.objects.filter(movie=media_obj).exists():
+                return False
+            # Older Floppy rows can store their only watch in end_date. Ignore
+            # the projection only when this watchlist sync created the row.
+            if media_obj.end_date is not None and not sync_item.created_by_sync:
                 return False
         elif item.media_type == MediaTypes.TV.value:
             if TV.objects.filter(user=self.user, item=item).count() != 1:
                 return False
+            if Episode.all_objects.filter(
+                related_season__related_tv=media_obj
+            ).exists():
+                return False
+            if media_obj.end_date is not None and not sync_item.created_by_sync:
+                return False
         else:
             return False
-
-        if media_obj.status != Status.PLANNING.value:
-            return False
-        if getattr(media_obj, "score", None) is not None:
-            return False
-        if (getattr(media_obj, "progress", 0) or 0) != 0:
-            return False
-        if getattr(media_obj, "notes", "").strip():
-            return False
-        if getattr(media_obj, "start_date", None) is not None:
-            return False
-        return getattr(media_obj, "end_date", None) is None
+        return True
 
     def _warn(self, message: str) -> None:
         """Collect a warning without duplicating format logic in callers."""
