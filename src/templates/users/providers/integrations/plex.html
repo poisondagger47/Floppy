@@ -185,6 +185,17 @@
               </button>
             </div>
           </form>{% if provider_forms.plex_mark_watched %}</div>{% endif %}
+          <form method="post" action="{% url 'fork_plex_full_watched_sync' %}" class="pt-3">
+            {% csrf_token %}
+            {% if provider_slug %}<input type="hidden" name="next" value="{{ request.get_full_path }}">{% endif %}
+            <p class="text-xs text-[var(--color-text-muted)] mb-2">
+              {% translate "Mirror watched state across your full Plex library. Movies are reopened with history kept; unwatched episodes retract one latest Floppy play per sync." %}
+            </p>
+            <button type="submit" class="flex items-center px-4 py-2 bg-indigo-600 text-white rounded-md hover:bg-indigo-700 transition-colors text-sm cursor-pointer">
+              {% include "app/icons/circle-check.svg" with classes="w-4 h-4 mr-2" %}
+              {% translate "Sync full library now" %}
+            </button>
+          </form>
         {% else %}
           <p class="text-sm text-[var(--color-warning-text)]">{% translate "Connect Plex from its Connection tab to use this." %}</p>
         {% endif %}

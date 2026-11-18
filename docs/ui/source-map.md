@@ -951,6 +951,8 @@ Status: `Partial / coexisting`
 
 ## SET-PROVIDERS
 
+Plex watched-state sync is available from the web server fallback and native `ProviderImportPanel`. Both queue the same user-scoped worker through the provider sync action; the worker scans current Plex movie/show sections, marks watched entries, and applies unwatched entries through Floppy's retraction service. Movies are reopened without deleting play history; for episodes, one latest play is retracted per sync and older plays remain. Web: visual/runtime comparison not captured in this environment. iOS and Android: implementation uses the shared React Native panel and existing authenticated provider transport; runtime not verified.
+
 Shared ProviderSettingsView and ProviderDetailView receive guidesSessionRequired from the provider adapter. Bearer responses omit credential-bearing webhook/install/configure guides and show password sign-in guidance; other connection forms, settings and browser/session defaults remain. Existing partial/coexisting ownership and full-parity retirement conditions remain. Transport/server regressions cover redaction; browser appearance and actual iOS/Android runtime for this state are not verified.
 
 TextField exposes optional input/label styles and a decimal keyboard for native manual entry; existing consumers retain defaults. iOS and Android not verified.

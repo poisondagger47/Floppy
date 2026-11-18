@@ -35,10 +35,14 @@ TESTABLE = frozenset({"jellyfin", "radarr", "sonarr", "mylar", "kapowarr"})
 # Providers whose "Sync now" posts only saved-account parameters on the web.
 SYNC_NOW = frozenset({
     "audiobookshelf", "radarr", "sonarr", "mylar", "kapowarr", "stremio", "storyteller", "koreader",
-    "pocketcasts", "gpodder", "xbox", "psn", "lastfm", "koito",
+    "pocketcasts", "gpodder", "xbox", "psn", "lastfm", "koito", "plex",
 })
 # Providers whose web "Sync now" posts to a route not named ``import_<slug>``.
-SYNC_ROUTES = {"lastfm": "poll_lastfm_manual", "koito": "poll_koito_manual"}
+SYNC_ROUTES = {
+    "lastfm": "poll_lastfm_manual",
+    "koito": "poll_koito_manual",
+    "plex": "fork_plex_full_watched_sync",
+}
 # Username-driven imports and schedules: provider slug -> web import route.
 IMPORT_ROUTES = {
     "mal": "import_mal",
@@ -213,7 +217,13 @@ def _connection_block(slug, context, item, request):
         "account": _clean(connection) if connection else None,
         "canLink": slug in BROWSER_HANDOFF,
         "canTest": slug in TESTABLE,
-        "canSync": slug in SYNC_NOW,
+        "canSync": slug in SYNC_NOW and (
+            slug != "plex"
+            or bool(
+                context.get("plex_account")
+                and context["plex_account"].plex_token
+            )
+        ),
         "canSchedule": slug in IMPORT_ROUTES,
     }
 

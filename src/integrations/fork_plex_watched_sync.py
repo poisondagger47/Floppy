@@ -1,0 +1,432 @@
+"""Fork-only full Plex watched-state reconciliation.
+
+This intentionally lives outside the upstream Plex importer. It scans the
+connected user's current library view and reconciles watched state both ways.
+"""
+
+from __future__ import annotations
+
+import logging
+from datetime import UTC, datetime
+
+import requests
+from django.contrib import messages
+from django.contrib.auth import get_user_model
+from django.contrib.auth.decorators import login_required
+from django.shortcuts import redirect
+from django.urls import path, reverse
+from django.utils import timezone
+from django.views.decorators.http import require_POST
+
+from app import cache_utils
+from app import helpers as app_helpers
+from app.models import Episode, Item, MediaTypes, Movie, Season, Sources, Status, TV
+from app.services.unwatch import retract_episode_watch, retract_watch
+from integrations import plex as plex_api
+from integrations.models import PlexAccount
+from integrations.safe_fetch import send_to_self_hosted
+
+logger = logging.getLogger(__name__)
+
+
+def _match_item(plex_item, media_types, source):
+    """Match Plex IDs against the selected catalogue, then title/year."""
+    if isinstance(media_types, str):
+        media_types = (media_types,)
+    for guid in plex_item.get("Guid") or []:
+        value = (guid.get("id") or "").strip()
+        if "://" not in value:
+            continue
+        provider, external_id = value.split("://", 1)
+        external_id = external_id.split("?", 1)[0]
+        if not external_id:
+            continue
+        expected_provider = {
+            Sources.TMDB.value: "tmdb",
+            Sources.TVDB.value: "tvdb",
+        }.get(source)
+        if provider == expected_provider:
+            item = Item.objects.filter(
+                media_type__in=media_types,
+                source=source,
+                media_id=external_id,
+            ).first()
+        elif provider == "imdb":
+            item = Item.objects.filter(
+                media_type__in=media_types,
+                source=source,
+                provider_external_ids__imdb_id=external_id,
+            ).first()
+        else:
+            item = None
+        if item:
+            return item
+
+    title = plex_item.get("title")
+    if not title:
+        return None
+    candidates = Item.objects.filter(
+        media_type__in=media_types, source=source, title__iexact=title
+    )
+    if plex_item.get("year"):
+        candidates = candidates.filter(release_datetime__year=plex_item["year"])
+    return candidates.first() if candidates.count() == 1 else None
+
+
+def _all_leaves(section, rating_key):
+    """Fetch the episode list for a Plex show using its selected server URI."""
+    token = section.get("access_token")
+    response = send_to_self_hosted(
+        requests.get,
+        f"{section['uri']}/library/metadata/{rating_key}/allLeaves",
+        headers=plex_api._headers(token),
+        params={"X-Plex-Token": token},
+        timeout=30,
+    )
+    plex_api._raise_for_auth(response)
+    if not response.ok:
+        raise plex_api.PlexClientError(
+            f"Plex returned HTTP {response.status_code} while listing episodes."
+        )
+    if "json" in response.headers.get("Content-Type", ""):
+        container = response.json().get("MediaContainer") or {}
+        return container.get("Metadata") or []
+    return plex_api._parse_history_xml(response.text)[0]
+
+
+def _plex_tokens_for_user(user, account):
+    """Resolve Plex account tokens for the connected owner and Home users."""
+    names = [
+        name.strip()
+        for name in (user.plex_usernames or "").split(",")
+        if name.strip()
+    ]
+    owner_name = (account.plex_username or "").strip()
+    headers = {
+        "Accept": "application/json",
+        "X-Plex-Product": "Floppy",
+        "X-Plex-Client-Identifier": "Floppy-Full-Watched-Sync",
+        "X-Plex-Token": account.plex_token,
+    }
+    if not names:
+        return [account.plex_token]
+
+    tokens = []
+    home_users = None
+    try:
+        for plex_username in names:
+            if owner_name and plex_username.casefold() == owner_name.casefold():
+                tokens.append(account.plex_token)
+                continue
+            if home_users is None:
+                headers["X-Plex-Token"] = account.plex_token
+                home = requests.get(
+                    "https://plex.tv/api/v2/home/users", headers=headers, timeout=10
+                )
+                if not home.ok:
+                    raise plex_api.PlexClientError(
+                        "Could not fetch Plex Home users for the managed account."
+                    )
+                home_users = home.json().get("users", [])
+            target = next(
+                (entry for entry in home_users
+                 if (entry.get("title") or "").casefold() == plex_username.casefold()),
+                None,
+            )
+            if not target or not target.get("uuid"):
+                raise plex_api.PlexClientError(
+                    f"Configured Plex Home user '{plex_username}' was not found."
+                )
+            headers["X-Plex-Token"] = account.plex_token
+            switched = requests.post(
+                f"https://plex.tv/api/v2/home/users/{target['uuid']}/switch",
+                headers=headers,
+                json={"pin": ""},
+                timeout=10,
+            )
+            if switched.status_code not in (200, 201):
+                raise plex_api.PlexClientError(
+                    f"Could not switch to Plex Home user '{plex_username}'."
+                )
+            auth_token = switched.json().get("authToken")
+            if not auth_token:
+                raise plex_api.PlexClientError(
+                    f"Plex returned no authentication token for '{plex_username}'."
+                )
+            tokens.append(auth_token)
+    except (requests.RequestException, ValueError, TypeError) as exc:
+        logger.warning(
+            "Could not resolve Plex Home token for user_id=%s: %s", user.id, exc
+        )
+        raise plex_api.PlexClientError(
+            "Could not resolve the Plex Home user's server access."
+        ) from exc
+    return list(dict.fromkeys(tokens))
+
+
+def _sync_movies(user, section, stats, *, sync_unwatched):
+    token = section.get("access_token")
+    start = 0
+    while True:
+        entries, total = plex_api.fetch_section_all_items(
+            token, section["uri"], str(section["id"]), start=start
+        )
+        for entry in entries:
+            item = _match_item(entry, MediaTypes.MOVIE.value, Sources.TMDB.value)
+            if not item:
+                stats["unmatched"] += 1
+                continue
+            stats["movies_checked"] += 1
+            movie = Movie.objects.filter(user=user, item=item).first()
+            is_plex_watched = int(entry.get("viewCount") or 0) > 0
+            if not is_plex_watched:
+                if (
+                    sync_unwatched
+                    and movie
+                    and movie.status == Status.COMPLETED.value
+                ):
+                    retract_watch(user, item)
+                    stats["movies_unwatched"] += 1
+                continue
+            if movie and movie.status == Status.COMPLETED.value:
+                continue
+            viewed = entry.get("lastViewedAt")
+            watched_at = (
+                datetime.fromtimestamp(int(viewed), tz=UTC)
+                if viewed
+                else timezone.now()
+            )
+            if movie is None:
+                movie = Movie.objects.create(
+                    user=user,
+                    item=item,
+                    status=Status.IN_PROGRESS.value,
+                )
+            movie.watch(
+                watched_at,
+                external_id=f"plex-library:{entry.get('ratingKey')}",
+                entry_source="plex",
+            )
+            stats["movies_marked_watched"] += 1
+        start += len(entries)
+        if not entries or start >= total:
+            break
+
+
+def _sync_shows(user, section, stats, *, sync_unwatched):
+    token = section.get("access_token")
+    start = 0
+    while True:
+        entries, total = plex_api.fetch_section_all_items(
+            token, section["uri"], str(section["id"]), start=start
+        )
+        for entry in entries:
+            show_item = _match_item(
+                entry,
+                (MediaTypes.TV.value, MediaTypes.ANIME.value),
+                Sources.TVDB.value,
+            )
+            if not show_item:
+                stats["unmatched"] += 1
+                continue
+            stats["shows_checked"] += 1
+            tv = TV.objects.filter(user=user, item=show_item).first()
+            leaves = _all_leaves(section, entry["ratingKey"])
+            watched_leaves = [
+                leaf for leaf in leaves if int(leaf.get("viewCount") or 0) > 0
+            ]
+            if not watched_leaves and (not sync_unwatched or tv is None):
+                continue
+            if tv is None and watched_leaves:
+                tv = TV.objects.create(
+                    user=user, item=show_item, status=Status.IN_PROGRESS.value
+                )
+
+            modified_seasons = set()
+            season_leaf_counts = {}
+            for leaf in leaves:
+                try:
+                    season_number = int(leaf["parentIndex"])
+                    int(leaf["index"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                season_leaf_counts[season_number] = (
+                    season_leaf_counts.get(season_number, 0) + 1
+                )
+
+            for leaf in leaves:
+                try:
+                    season_number = int(leaf["parentIndex"])
+                    episode_number = int(leaf["index"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                is_plex_watched = int(leaf.get("viewCount") or 0) > 0
+                if not is_plex_watched and not sync_unwatched:
+                    continue
+                season_item = Item.objects.filter(
+                    media_type=MediaTypes.SEASON.value,
+                    media_id=show_item.media_id,
+                    source=show_item.source,
+                    season_number=season_number,
+                ).first()
+                if season_item is None:
+                    if not is_plex_watched:
+                        continue
+                    season_item = Item.objects.create(
+                        media_type=MediaTypes.SEASON.value,
+                        media_id=show_item.media_id,
+                        source=show_item.source,
+                        season_number=season_number,
+                        title=f"{show_item.title} Season {season_number}",
+                    )
+                if is_plex_watched:
+                    season, _ = Season.objects.get_or_create(
+                        user=user,
+                        related_tv=tv,
+                        item=season_item,
+                        defaults={"status": Status.IN_PROGRESS.value},
+                    )
+                else:
+                    season = Season.objects.filter(
+                        user=user, related_tv=tv, item=season_item
+                    ).first()
+                    if season is None:
+                        continue
+                try:
+                    ep_item = season.get_episode_item(episode_number)
+                except Exception:
+                    logger.info(
+                        "Plex full sync could not resolve episode for "
+                        "user_id=%s show_item_id=%s S%02dE%02d",
+                        user.id,
+                        show_item.id,
+                        season_number,
+                        episode_number,
+                    )
+                    continue
+                has_floppy_watch = Episode.objects.filter(
+                    related_season=season, item=ep_item
+                ).exists()
+                if not is_plex_watched:
+                    if has_floppy_watch:
+                        result = retract_episode_watch(user, ep_item)
+                        stats["episodes_unwatched"] += result.deleted_plays
+                    continue
+                if has_floppy_watch:
+                    continue
+                last_viewed = leaf.get("lastViewedAt")
+                watched_at = (
+                    datetime.fromtimestamp(int(last_viewed), tz=UTC)
+                    if last_viewed
+                    else timezone.now()
+                )
+                season.watch(episode_number, watched_at, entry_source="plex")
+                modified_seasons.add(season)
+                stats["episodes_marked_watched"] += 1
+
+            for season in modified_seasons:
+                season._sync_status_after_episode_change(
+                    max_progress=season_leaf_counts.get(season.item.season_number),
+                    plays_added=True,
+                )
+
+        start += len(entries)
+        if not entries or start >= total:
+            break
+
+
+def sync_user(user_id, *, sync_unwatched=True):
+    """Synchronize watched state from all accessible Plex show/movie sections."""
+    user = get_user_model().objects.get(pk=user_id)
+    account = PlexAccount.objects.filter(user=user).first()
+    if not account or not account.plex_token:
+        raise plex_api.PlexClientError("Connect Plex before running a full sync.")
+    tokens = _plex_tokens_for_user(user, account)
+    if not tokens:
+        raise plex_api.PlexClientError("No Plex account tokens are available to sync.")
+    stats = {
+        "movies_checked": 0, "movies_marked_watched": 0,
+        "movies_unwatched": 0,
+        "shows_checked": 0,
+        "episodes_marked_watched": 0, "episodes_unwatched": 0,
+        "unmatched": 0,
+    }
+    try:
+        any_sections = False
+        for token in tokens:
+            sections = plex_api.list_sections(token)
+            any_sections = any_sections or bool(sections)
+            seen_items = set()
+            for section in sections:
+                kind = section.get("type")
+                identity = (section.get("machine_identifier"), str(section.get("id")))
+                if identity in seen_items or kind not in {"movie", "show"}:
+                    continue
+                seen_items.add(identity)
+                section["access_token"] = section.get("access_token") or token
+                if kind == "movie":
+                    _sync_movies(
+                        user, section, stats, sync_unwatched=sync_unwatched
+                    )
+                else:
+                    _sync_shows(
+                        user, section, stats, sync_unwatched=sync_unwatched
+                    )
+        if not any_sections:
+            raise plex_api.PlexClientError("No Plex libraries are available to sync.")
+    finally:
+        cache_utils.clear_library_view_caches(
+            user.id,
+            media_types=(
+                MediaTypes.EPISODE.value,
+                MediaTypes.TV.value,
+                MediaTypes.ANIME.value,
+                MediaTypes.MOVIE.value,
+                MediaTypes.SEASON.value,
+            ),
+        )
+    logger.info("Plex full watched sync finished user_id=%s counts=%s", user.id, stats)
+    return stats
+
+
+@login_required
+@require_POST
+def queue_full_watched_sync(request):
+    account = PlexAccount.objects.filter(user=request.user).first()
+    destination = app_helpers.safe_return_url(
+        request,
+        request.POST.get("next"),
+        reverse("provider_detail", args=["plex"]) + "?tab=import",
+    )
+    if request.user.is_demo:
+        messages.error(request, "Demo accounts cannot run a Plex library sync.")
+        return redirect(destination)
+    if not account or not account.plex_token:
+        messages.error(request, "Connect Plex before syncing watched status.")
+        return redirect(destination)
+    try:
+        from integrations.tasks import sync_plex_full_watched_library
+
+        sync_plex_full_watched_library.delay(
+            user_id=request.user.id, sync_unwatched=True
+        )
+    except Exception:
+        logger.exception(
+            "Could not queue full Plex watched sync user_id=%s", request.user.id
+        )
+        messages.error(
+            request,
+            "The Plex sync could not be queued. Check the worker and try again.",
+        )
+    else:
+        messages.success(request, "Full Plex watched-state sync queued.")
+    return redirect(destination)
+
+
+urlpatterns = [
+    path(
+        "import/plex/sync-watched-full",
+        queue_full_watched_sync,
+        name="fork_plex_full_watched_sync",
+    ),
+]

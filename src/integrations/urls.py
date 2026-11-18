@@ -496,3 +496,9 @@ from integrations.fork_plex_manual import (  # noqa: E402
 )
 
 urlpatterns += _fork_plex_manual_urlpatterns
+
+from integrations.fork_plex_watched_sync import (  # noqa: E402
+    urlpatterns as _fork_plex_watched_sync_urlpatterns,
+)
+
+urlpatterns += _fork_plex_watched_sync_urlpatterns

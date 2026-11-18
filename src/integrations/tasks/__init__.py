@@ -1,8 +1,10 @@
+import logging
 from importlib import import_module
 from pathlib import Path
 
 from celery import shared_task
 from django.contrib.auth import get_user_model
+from django.core.cache import cache
 
 _EXPORT_MODULES = {
     "export_tmdb_ratings": "integrations.tasks._ratings",
@@ -216,6 +218,25 @@ def scheduled_backup_export(
     return f"Backup saved to {filepath}"
 
 
+@shared_task(name="Sync Plex Full Watched Library")
+def sync_plex_full_watched_library(user_id, sync_unwatched=True):
+    """Run the fork-only full Plex watched-state reconciliation."""
+    from integrations.fork_plex_watched_sync import sync_user
+
+    lock_key = f"plex-full-watched-sync:{user_id}"
+    if not cache.add(lock_key, "running", timeout=60 * 60):
+        return "A full Plex watched-state sync is already running."
+    try:
+        return sync_user(user_id, sync_unwatched=sync_unwatched)
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "Plex full watched sync failed user_id=%s", user_id
+        )
+        raise
+    finally:
+        cache.delete(lock_key)
+
+
 __all__ = [
     "COMPACT_CHANGE_LOG_TASK_NAME",
     "COMPACT_RECEIPTS_TASK_NAME",
@@ -324,6 +345,7 @@ __all__ = [
     "sweep_watched_state_deliveries",
     "sync_mal_status",
     "sync_plex_mark_watched",
+    "sync_plex_full_watched_library",
     "sync_plex_watchlist",
     "update_collection_metadata_from_plex",
     "update_collection_metadata_from_plex_webhook",

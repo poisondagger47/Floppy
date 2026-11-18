@@ -67,7 +67,17 @@ export function ProviderImportPanel({
   palette = {},
   buttonPalette = {},
 }) {
-  const copy = { ...DEFAULT_LABELS, ...(labels || {}) };
+  const copy = {
+    ...DEFAULT_LABELS,
+    ...(slug === 'plex' ? {
+      syncTitle: 'Full library watched sync',
+      syncCopy: 'Mirror watched state across all Plex movie and show libraries. '
+        + 'Movies are reopened with history kept; unwatched episodes retract one latest Floppy play per sync.',
+      syncAction: 'Sync full library now',
+      syncing: 'Queueing…',
+    } : {}),
+    ...(labels || {}),
+  };
   const [form, setForm] = useState({
     username: '',
     mode: defaults.mode || 'new',
