@@ -7,6 +7,7 @@ from django.test import TestCase
 from django.urls import reverse
 
 from app.models import (
+    TV,
     Episode,
     Item,
     MediaTypes,
@@ -15,9 +16,13 @@ from app.models import (
     Season,
     Sources,
     Status,
-    TV,
 )
-from integrations.fork_plex_watched_sync import _match_item, _sync_movies, _sync_shows
+from integrations.fork_plex_watched_sync import (
+    _match_item,
+    _sync_movies,
+    _sync_shows,
+    sync_user,
+)
 from integrations.models import PlexAccount
 
 
@@ -58,7 +63,12 @@ class PlexFullWatchedSyncTests(TestCase):
             ],
             1,
         )
-        stats = {"movies_checked": 0, "movies_marked_watched": 0, "movies_unwatched": 0, "unmatched": 0}
+        stats = {
+            "movies_checked": 0,
+            "movies_marked_watched": 0,
+            "movies_unwatched": 0,
+            "unmatched": 0,
+        }
 
         _sync_movies(self.user, self.section, stats, sync_unwatched=True)
 
@@ -112,6 +122,110 @@ class PlexFullWatchedSyncTests(TestCase):
 
         self.assertEqual(matched, item)
 
+    @patch("integrations.fork_plex_watched_sync._all_leaves")
+    @patch("integrations.fork_plex_watched_sync.plex_api.fetch_section_all_items")
+    def test_fully_watched_show_uses_aggregate_without_fetching_leaves(
+        self, fetch_items, all_leaves
+    ):
+        item = Item.objects.create(
+            media_type=MediaTypes.TV.value,
+            source=Sources.TVDB.value,
+            media_id="789",
+            title="Completed Show",
+        )
+        fetch_items.return_value = (
+            [
+                {
+                    "ratingKey": "show-1",
+                    "Guid": [{"id": "tvdb://789"}],
+                    "title": "Completed Show",
+                    "viewedLeafCount": 8,
+                    "leafCount": 8,
+                }
+            ],
+            1,
+        )
+        stats = {
+            "shows_checked": 0,
+            "episodes_marked_watched": 0,
+            "episodes_unwatched": 0,
+            "unmatched": 0,
+        }
+
+        _sync_shows(
+            self.user,
+            {**self.section, "type": "show"},
+            stats,
+            sync_unwatched=True,
+        )
+
+        self.assertEqual(
+            TV.objects.get(user=self.user, item=item).status,
+            Status.COMPLETED.value,
+        )
+        all_leaves.assert_not_called()
+        self.assertEqual(stats["shows_completed_by_aggregate"], 1)
+
+    @patch("integrations.fork_plex_watched_sync._all_leaves")
+    @patch("integrations.fork_plex_watched_sync.plex_api.fetch_children")
+    @patch("integrations.fork_plex_watched_sync.plex_api.fetch_section_all_items")
+    def test_fully_watched_season_uses_aggregate_without_fetching_leaves(
+        self, fetch_items, fetch_children, all_leaves
+    ):
+        show_item = Item.objects.create(
+            media_type=MediaTypes.TV.value,
+            source=Sources.TVDB.value,
+            media_id="789",
+            title="Partially Completed Show",
+        )
+        tv = TV.objects.create(
+            user=self.user,
+            item=show_item,
+            status=Status.IN_PROGRESS.value,
+        )
+        fetch_items.return_value = (
+            [
+                {
+                    "ratingKey": "show-1",
+                    "Guid": [{"id": "tvdb://789"}],
+                    "title": "Partially Completed Show",
+                    "viewedLeafCount": 8,
+                    "leafCount": 16,
+                }
+            ],
+            1,
+        )
+        fetch_children.return_value = [
+            {
+                "ratingKey": "season-1",
+                "index": 1,
+                "viewedLeafCount": 8,
+                "leafCount": 8,
+            },
+            {
+                "ratingKey": "season-2",
+                "index": 2,
+                "viewedLeafCount": 0,
+                "leafCount": 8,
+            },
+        ]
+
+        _sync_shows(
+            self.user,
+            {**self.section, "type": "show"},
+            {
+                "shows_checked": 0,
+                "episodes_marked_watched": 0,
+                "episodes_unwatched": 0,
+                "unmatched": 0,
+            },
+            sync_unwatched=True,
+        )
+
+        season = Season.objects.get(related_tv=tv, item__season_number=1)
+        self.assertEqual(season.status, Status.COMPLETED.value)
+        all_leaves.assert_not_called()
+
     @patch("integrations.fork_plex_watched_sync.plex_api.fetch_section_all_items")
     def test_retracts_movie_status_but_keeps_play_history_when_plex_unwatches(
         self, fetch_items
@@ -144,20 +258,28 @@ class PlexFullWatchedSyncTests(TestCase):
             ],
             1,
         )
-        stats = {"movies_checked": 0, "movies_marked_watched": 0, "movies_unwatched": 0, "unmatched": 0}
+        stats = {
+            "movies_checked": 0,
+            "movies_marked_watched": 0,
+            "movies_unwatched": 0,
+            "unmatched": 0,
+        }
 
         _sync_movies(self.user, self.section, stats, sync_unwatched=True)
 
         movie.refresh_from_db()
         self.assertEqual(movie.status, Status.IN_PROGRESS.value)
         self.assertIsNone(movie.end_date)
-        self.assertTrue(MoviePlay.objects.filter(movie=movie, external_id="older-play").exists())
+        self.assertTrue(
+            MoviePlay.objects.filter(movie=movie, external_id="older-play").exists()
+        )
         self.assertEqual(stats["movies_unwatched"], 1)
 
     @patch("integrations.fork_plex_watched_sync._all_leaves")
+    @patch("integrations.fork_plex_watched_sync.plex_api.fetch_children")
     @patch("integrations.fork_plex_watched_sync.plex_api.fetch_section_all_items")
     def test_retracts_one_latest_episode_play_when_plex_unwatches(
-        self, fetch_items, all_leaves
+        self, fetch_items, fetch_children, all_leaves
     ):
         show_item = Item.objects.create(
             media_type=MediaTypes.TV.value,
@@ -205,6 +327,14 @@ class PlexFullWatchedSyncTests(TestCase):
         all_leaves.return_value = [
             {"ratingKey": "episode-1", "parentIndex": 1, "index": 1, "viewCount": 0}
         ]
+        fetch_children.return_value = [
+            {
+                "ratingKey": "season-1",
+                "index": 1,
+                "viewedLeafCount": 0,
+                "leafCount": 1,
+            }
+        ]
         section = {**self.section, "type": "show"}
         stats = {
             "shows_checked": 0,
@@ -215,7 +345,9 @@ class PlexFullWatchedSyncTests(TestCase):
 
         _sync_shows(self.user, section, stats, sync_unwatched=True)
 
-        self.assertFalse(Episode.objects.filter(related_season=season, item=episode_item).exists())
+        self.assertFalse(
+            Episode.objects.filter(related_season=season, item=episode_item).exists()
+        )
         self.assertEqual(stats["episodes_unwatched"], 1)
 
     @patch("integrations.tasks.sync_plex_full_watched_library.delay")
@@ -231,4 +363,35 @@ class PlexFullWatchedSyncTests(TestCase):
 
         self.assertEqual(response.status_code, 302)
         queue_task.assert_called_once_with(user_id=self.user.id, sync_unwatched=True)
-        self.assertIn("queued", str(list(get_messages(response.wsgi_request))[0]).lower())
+        self.assertIn(
+            "queued", str(next(iter(get_messages(response.wsgi_request)))).lower()
+        )
+
+    @patch("integrations.fork_plex_watched_sync.cache_utils.clear_library_view_caches")
+    @patch("integrations.fork_plex_watched_sync.plex_api.fetch_section_all_items")
+    @patch("integrations.fork_plex_watched_sync.plex_api.list_sections")
+    @patch(
+        "integrations.fork_plex_watched_sync._plex_tokens_for_user",
+        return_value=["plex-token"],
+    )
+    def test_ignores_mintie_photos_section(
+        self, _tokens, list_sections, fetch_items, _clear_caches
+    ):
+        PlexAccount.objects.create(
+            user=self.user,
+            plex_token="plex-token",
+            plex_username="plex-user",
+        )
+        list_sections.return_value = [
+            {
+                "id": "photos",
+                "title": "Mintie Photos",
+                "type": "movie",
+                "machine_identifier": "plex-server",
+            }
+        ]
+
+        stats = sync_user(self.user.id)
+
+        self.assertEqual(stats["ignored_sections"], 1)
+        fetch_items.assert_not_called()
