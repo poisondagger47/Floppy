@@ -350,7 +350,16 @@ def _sync_movies(user, section, stats, *, sync_unwatched):
             break
 
 
-def _sync_shows(user, section, stats, *, sync_unwatched):
+def _sync_shows(
+    user,
+    section,
+    stats,
+    *,
+    sync_unwatched,
+    complete_seasons: set[tuple[int, int]] | None = None,
+):
+    if complete_seasons is None:
+        complete_seasons = set()
     token = section.get("access_token")
     start = 0
     while True:
@@ -385,7 +394,7 @@ def _sync_shows(user, section, stats, *, sync_unwatched):
                 and (tv is None or tv.status not in USER_HELD_STATUSES)
             ):
                 if tv is None:
-                    TV.objects.create(
+                    tv = TV.objects.create(
                         user=user,
                         item=show_item,
                         status=Status.COMPLETED.value,
@@ -396,7 +405,6 @@ def _sync_shows(user, section, stats, *, sync_unwatched):
                 stats["shows_completed_by_aggregate"] = (
                     stats.get("shows_completed_by_aggregate", 0) + 1
                 )
-                continue
 
             # An entirely unwatched show with no Floppy tracker has no state to
             # retract. Avoid fetching its episode list altogether.
@@ -422,6 +430,10 @@ def _sync_shows(user, section, stats, *, sync_unwatched):
                         continue
                     grouped.setdefault(number, []).append(leaf)
                 for season_number, season_leaves in grouped.items():
+                    if all(
+                        int(leaf.get("viewCount") or 0) > 0 for leaf in season_leaves
+                    ):
+                        complete_seasons.add((show_item.pk, season_number))
                     _sync_season_leaves(
                         user,
                         show_item,
@@ -443,12 +455,16 @@ def _sync_shows(user, section, stats, *, sync_unwatched):
                     )
                 except (TypeError, ValueError):
                     continue
+                complete_key = (show_item.pk, season_number)
+                if complete_key in complete_seasons:
+                    continue
                 season_counts = _leaf_counts(plex_season)
                 if (
                     season_counts
                     and season_counts[0] == season_counts[1]
                     and tv.status not in USER_HELD_STATUSES
                 ):
+                    complete_seasons.add(complete_key)
                     _complete_season_from_plex(
                         user, show_item, tv, season_number, stats
                     )
@@ -469,6 +485,10 @@ def _sync_shows(user, section, stats, *, sync_unwatched):
                     continue
 
                 leaves = _all_leaves(section, plex_season["ratingKey"])
+                if leaves and all(
+                    int(leaf.get("viewCount") or 0) > 0 for leaf in leaves
+                ):
+                    complete_seasons.add(complete_key)
                 _sync_season_leaves(
                     user,
                     show_item,
@@ -517,6 +537,7 @@ def sync_user(user_id, *, sync_unwatched=True):
             sections = plex_api.list_sections(token)
             any_sections = any_sections or bool(sections)
             seen_items = set()
+            complete_seasons = set()
             for section in sections:
                 kind = section.get("type")
                 section_name = str(
@@ -533,7 +554,13 @@ def sync_user(user_id, *, sync_unwatched=True):
                 if kind == "movie":
                     _sync_movies(user, section, stats, sync_unwatched=sync_unwatched)
                 else:
-                    _sync_shows(user, section, stats, sync_unwatched=sync_unwatched)
+                    _sync_shows(
+                        user,
+                        section,
+                        stats,
+                        sync_unwatched=sync_unwatched,
+                        complete_seasons=complete_seasons,
+                    )
         if not any_sections:
             raise plex_api.PlexClientError(  # noqa: TRY003
                 "No Plex libraries are available to sync."  # noqa: EM101

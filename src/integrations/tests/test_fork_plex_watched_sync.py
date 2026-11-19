@@ -31,7 +31,7 @@ class PlexFullWatchedSyncTests(TestCase):
         self.user = get_user_model().objects.create_user(username="plex-sync-test")
         self.metadata_patcher = patch(
             "app.providers.services.get_media_metadata",
-            return_value={"max_progress": None, "related": {}},
+            return_value={"max_progress": None, "related": {}, "episodes": []},
         )
         self.metadata_patcher.start()
         self.addCleanup(self.metadata_patcher.stop)
@@ -123,9 +123,10 @@ class PlexFullWatchedSyncTests(TestCase):
         self.assertEqual(matched, item)
 
     @patch("integrations.fork_plex_watched_sync._all_leaves")
+    @patch("integrations.fork_plex_watched_sync.plex_api.fetch_children")
     @patch("integrations.fork_plex_watched_sync.plex_api.fetch_section_all_items")
     def test_fully_watched_show_uses_aggregate_without_fetching_leaves(
-        self, fetch_items, all_leaves
+        self, fetch_items, fetch_children, all_leaves
     ):
         item = Item.objects.create(
             media_type=MediaTypes.TV.value,
@@ -145,6 +146,14 @@ class PlexFullWatchedSyncTests(TestCase):
             ],
             1,
         )
+        fetch_children.return_value = [
+            {
+                "ratingKey": "season-1",
+                "index": 1,
+                "viewedLeafCount": 8,
+                "leafCount": 8,
+            },
+        ]
         stats = {
             "shows_checked": 0,
             "episodes_marked_watched": 0,
@@ -163,8 +172,97 @@ class PlexFullWatchedSyncTests(TestCase):
             TV.objects.get(user=self.user, item=item).status,
             Status.COMPLETED.value,
         )
+        self.assertEqual(
+            Season.objects.get(user=self.user, related_tv__item=item).status,
+            Status.COMPLETED.value,
+        )
+        fetch_children.assert_called_once()
         all_leaves.assert_not_called()
         self.assertEqual(stats["shows_completed_by_aggregate"], 1)
+
+    @patch("integrations.fork_plex_watched_sync._all_leaves")
+    @patch("integrations.fork_plex_watched_sync.plex_api.fetch_children")
+    @patch("integrations.fork_plex_watched_sync.plex_api.fetch_section_all_items")
+    def test_partial_duplicate_library_cannot_undo_completed_season(
+        self, fetch_items, fetch_children, all_leaves
+    ):
+        show_item = Item.objects.create(
+            media_type=MediaTypes.TV.value,
+            source=Sources.TVDB.value,
+            media_id="789",
+            title="Duplicate Library Show",
+        )
+        fetch_items.side_effect = [
+            (
+                [
+                    {
+                        "ratingKey": "show-complete-copy",
+                        "Guid": [{"id": "tvdb://789"}],
+                        "title": "Duplicate Library Show",
+                        "viewedLeafCount": 20,
+                        "leafCount": 24,
+                    }
+                ],
+                1,
+            ),
+            (
+                [
+                    {
+                        "ratingKey": "show-partial-copy",
+                        "Guid": [{"id": "tvdb://789"}],
+                        "title": "Duplicate Library Show",
+                        "viewedLeafCount": 19,
+                        "leafCount": 24,
+                    }
+                ],
+                1,
+            ),
+        ]
+        fetch_children.side_effect = [
+            [
+                {
+                    "ratingKey": "season-complete-copy",
+                    "index": 6,
+                    "viewedLeafCount": 21,
+                    "leafCount": 21,
+                }
+            ],
+            [
+                {
+                    "ratingKey": "season-partial-copy",
+                    "index": 6,
+                    "viewedLeafCount": 19,
+                    "leafCount": 21,
+                }
+            ],
+        ]
+        complete_seasons = set()
+        stats = {
+            "shows_checked": 0,
+            "episodes_marked_watched": 0,
+            "episodes_unwatched": 0,
+            "unmatched": 0,
+        }
+
+        _sync_shows(
+            self.user,
+            {**self.section, "type": "show", "title": "4k TV Shows"},
+            stats,
+            sync_unwatched=True,
+            complete_seasons=complete_seasons,
+        )
+        _sync_shows(
+            self.user,
+            {**self.section, "type": "show", "title": "TV Shows"},
+            stats,
+            sync_unwatched=True,
+            complete_seasons=complete_seasons,
+        )
+
+        season = Season.objects.get(user=self.user, related_tv__item=show_item)
+        self.assertEqual(season.status, Status.COMPLETED.value)
+        self.assertIn((show_item.pk, 6), complete_seasons)
+        all_leaves.assert_not_called()
 
     @patch("integrations.fork_plex_watched_sync._all_leaves")
     @patch("integrations.fork_plex_watched_sync.plex_api.fetch_children")
