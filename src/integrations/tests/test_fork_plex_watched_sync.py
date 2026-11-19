@@ -281,6 +281,19 @@ class PlexFullWatchedSyncTests(TestCase):
             item=show_item,
             status=Status.IN_PROGRESS.value,
         )
+        alternate_season_item = Item.objects.create(
+            media_type=MediaTypes.SEASON.value,
+            source=Sources.TMDB.value,
+            media_id="111",
+            season_number=1,
+            title="Partially Completed Show Season 1",
+        )
+        alternate_season = Season.objects.create(
+            user=self.user,
+            related_tv=tv,
+            item=alternate_season_item,
+            status=Status.IN_PROGRESS.value,
+        )
         fetch_items.return_value = (
             [
                 {
@@ -320,8 +333,14 @@ class PlexFullWatchedSyncTests(TestCase):
             sync_unwatched=True,
         )
 
-        season = Season.objects.get(related_tv=tv, item__season_number=1)
+        season = Season.objects.get(
+            related_tv=tv,
+            item__season_number=1,
+            item__source=Sources.TVDB.value,
+        )
         self.assertEqual(season.status, Status.COMPLETED.value)
+        alternate_season.refresh_from_db()
+        self.assertEqual(alternate_season.status, Status.COMPLETED.value)
         all_leaves.assert_not_called()
 
     @patch("integrations.fork_plex_watched_sync.plex_api.fetch_section_all_items")

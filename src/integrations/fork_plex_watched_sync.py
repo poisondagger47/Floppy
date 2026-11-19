@@ -136,24 +136,34 @@ def _season_item(show_item, season_number):
 
 
 def _complete_season_from_plex(user, show_item, tv, season_number, stats):
-    """Use Plex's aggregate count for a fully watched season."""
+    """Use Plex's aggregate count for every Floppy tracker of that season."""
     season_item = _season_item(show_item, season_number)
-    season, created = Season.objects.get_or_create(
+    Season.objects.get_or_create(
         user=user,
         related_tv=tv,
         item=season_item,
         defaults={"status": Status.COMPLETED.value},
     )
-    if not created and season.status not in USER_HELD_STATUSES | {
-        Status.COMPLETED.value,
-    }:
-        season.status = Status.COMPLETED.value
-        season.save(update_fields=["status"])
-    if created or season.status == Status.COMPLETED.value:
+    seasons_completed = False
+    for season in Season.objects.filter(
+        user=user,
+        related_tv=tv,
+        item__season_number=season_number,
+    ):
+        if season.status not in USER_HELD_STATUSES | {Status.COMPLETED.value}:
+            season.status = Status.COMPLETED.value
+            season.save(update_fields=["status"])
+        if season.status == Status.COMPLETED.value:
+            seasons_completed = True
+    if seasons_completed:
         stats["seasons_completed_by_aggregate"] = (
             stats.get("seasons_completed_by_aggregate", 0) + 1
         )
-    return season
+    return Season.objects.filter(
+        user=user,
+        related_tv=tv,
+        item=season_item,
+    ).first()
 
 
 def _retract_unwatched_season(user, season, stats):
