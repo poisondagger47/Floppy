@@ -6,10 +6,12 @@ from copy import deepcopy
 from datetime import timedelta
 
 from django.db import IntegrityError
+from django.db.models import Count
 from django.utils import timezone
 
 from app.mixins import disable_fetch_releases
 from app.models import (
+    TV,
     Episode,
     Item,
     ItemTag,
@@ -18,7 +20,6 @@ from app.models import (
     MoviePlay,
     Sources,
     Status,
-    TV,
 )
 from app.providers import services, tmdb
 from integrations import external_references
@@ -49,7 +50,12 @@ class PlexWatchlistSyncService:
         self.source_username = ""
         self.source_account_id = ""
         self.source_server_id = ""
-        self.watchlist_tag = user.tags.filter(pk=user.watchlist_import_tag_id).first() if user.watchlist_import_tag_id else None
+        self._watchlist_snapshot_complete = True
+        self.watchlist_tag = (
+            user.tags.filter(pk=user.watchlist_import_tag_id).first()
+            if user.watchlist_import_tag_id
+            else None
+        )
 
     def sync(self) -> tuple[dict[str, int], str]:
         """Run the watchlist sync and return counts plus warning text."""
@@ -59,6 +65,7 @@ class PlexWatchlistSyncService:
 
         self.counts = defaultdict(int)
         self.warnings = []
+        self._watchlist_snapshot_complete = True
         (
             self.source_username,
             self.source_account_id,
@@ -72,7 +79,13 @@ class PlexWatchlistSyncService:
                 if item_id is not None:
                     seen_item_ids.add(item_id)
 
-            self._reconcile_removals(seen_item_ids)
+            if self._watchlist_snapshot_complete:
+                self._reconcile_removals(seen_item_ids)
+                self._reconcile_unwatchlisted_trackers(seen_item_ids)
+            else:
+                self._warn(
+                    "Skipped watchlist cleanup because some Plex items could not be matched safely.",
+                )
 
         warning_text = "\n".join(dict.fromkeys(self.warnings))
         return dict(self.counts), warning_text
@@ -97,11 +110,14 @@ class PlexWatchlistSyncService:
 
         username = username or (account_data.get("username") or "").strip()
         account_id = account_id or str(account_data.get("id") or "").strip()
-        server_id = server_id or str(
-            account_data.get("machineIdentifier")
-            or account_data.get("machine_identifier")
-            or "",
-        ).strip()
+        server_id = (
+            server_id
+            or str(
+                account_data.get("machineIdentifier")
+                or account_data.get("machine_identifier")
+                or "",
+            ).strip()
+        )
 
         updated_fields = []
         if username and username != self.account.plex_username:
@@ -119,6 +135,7 @@ class PlexWatchlistSyncService:
         """Fetch the full watchlist from Plex Discover."""
         entries: list[dict] = []
         start = 0
+        expected_total = 0
 
         while True:
             try:
@@ -138,9 +155,16 @@ class PlexWatchlistSyncService:
                 break
 
             entries.extend(page_entries)
+            expected_total = total
             start += len(page_entries)
             if start >= total or len(page_entries) < WATCHLIST_PAGE_SIZE:
                 break
+
+        if len(entries) < expected_total:
+            self._watchlist_snapshot_complete = False
+            self._warn(
+                "Skipped watchlist cleanup because Plex returned an incomplete watchlist page.",
+            )
 
         return entries
 
@@ -171,10 +195,12 @@ class PlexWatchlistSyncService:
             external_references.ExternalReferenceReviewStatus.IGNORED.value
         ):
             self.counts["skipped_ignored"] += 1
+            self._watchlist_snapshot_complete = False
             return None
         tmdb_id = self._resolve_tmdb_id(media_type, external_ids, entry, reference)
         if not tmdb_id:
             self.counts["skipped_missing_ids"] += 1
+            self._watchlist_snapshot_complete = False
             self._warn(
                 f"Skipped Plex watchlist entry without resolvable IDs: {entry.get('title') or 'Unknown title'}.",
             )
@@ -182,6 +208,7 @@ class PlexWatchlistSyncService:
 
         metadata = self._fetch_tmdb_metadata(media_type, tmdb_id, entry)
         if not metadata:
+            self._watchlist_snapshot_complete = False
             return None
 
         item = self._get_or_create_item(media_type, tmdb_id, metadata, entry)
@@ -393,7 +420,9 @@ class PlexWatchlistSyncService:
             media_obj = model_class.objects.create(
                 user=self.user,
                 item=item,
-                status=self.user.watchlist_import_status if self.user.watchlist_import_status in Status.values else Status.PLANNING.value,
+                status=self.user.watchlist_import_status
+                if self.user.watchlist_import_status in Status.values
+                else Status.PLANNING.value,
                 score=None,
                 notes="",
             )
@@ -493,9 +522,7 @@ class PlexWatchlistSyncService:
         for sync_item in stale_items:
             removed_media = False
             media_obj = self._get_media_instance(sync_item.item)
-            if media_obj and self._can_remove_unwatched_media(
-                sync_item, media_obj
-            ):
+            if media_obj and self._can_remove_unwatched_media(sync_item, media_obj):
                 media_obj.delete()
                 removed_media = True
                 self.counts["removed"] += 1
@@ -506,6 +533,42 @@ class PlexWatchlistSyncService:
             sync_item.is_active = False
             sync_item.removed_at = now
             sync_item.save(update_fields=["is_active", "removed_at"])
+
+    def _reconcile_unwatchlisted_trackers(self, seen_item_ids: set[int]) -> None:
+        """Remove unwatchlisted Movie/TV trackers that have no watch history."""
+        for model_class in (Movie, TV):
+            all_trackers = model_class.objects.filter(user=self.user)
+            tracker_counts = dict(
+                all_trackers.values("item_id")
+                .annotate(tracker_count=Count("pk"))
+                .values_list("item_id", "tracker_count")
+            )
+            if model_class is Movie:
+                history_ids = set(
+                    MoviePlay.objects.filter(movie__user=self.user)
+                    .values_list("movie_id", flat=True)
+                    .distinct()
+                )
+            else:
+                history_ids = set(
+                    Episode.all_objects.filter(
+                        related_season__related_tv__user=self.user
+                    )
+                    .values_list("related_season__related_tv_id", flat=True)
+                    .distinct()
+                )
+            trackers = all_trackers.exclude(item_id__in=seen_item_ids).select_related(
+                "item"
+            )
+            for media_obj in trackers:
+                if self._can_remove_unwatched_media(
+                    None,
+                    media_obj,
+                    tracker_count=tracker_counts.get(media_obj.item_id),
+                    has_watch_history=media_obj.pk in history_ids,
+                ):
+                    media_obj.delete()
+                    self.counts["removed"] += 1
 
     def _get_media_instance(self, item: Item):
         """Return the tracked Movie/TV row for the given item, if any."""
@@ -519,26 +582,45 @@ class PlexWatchlistSyncService:
             return TV.objects.filter(user=self.user, item=item).first()
         return None
 
-    def _can_remove_unwatched_media(self, sync_item, media_obj) -> bool:
-        """Remove a watchlist-linked tracker only when it has no play history."""
-        item = sync_item.item
+    def _can_remove_unwatched_media(
+        self,
+        sync_item,
+        media_obj,
+        *,
+        tracker_count: int | None = None,
+        has_watch_history: bool | None = None,
+    ) -> bool:
+        """Remove a tracker only when it has no play history."""
+        item = sync_item.item if sync_item else media_obj.item
         if item.media_type == MediaTypes.MOVIE.value:
-            if Movie.objects.filter(user=self.user, item=item).count() != 1:
+            if tracker_count is None:
+                tracker_count = Movie.objects.filter(user=self.user, item=item).count()
+            if tracker_count != 1:
                 return False
-            if MoviePlay.objects.filter(movie=media_obj).exists():
+            if has_watch_history is None:
+                has_watch_history = MoviePlay.objects.filter(movie=media_obj).exists()
+            if has_watch_history:
                 return False
             # Older Floppy rows can store their only watch in end_date. Ignore
             # the projection only when this watchlist sync created the row.
-            if media_obj.end_date is not None and not sync_item.created_by_sync:
+            if media_obj.end_date is not None and not (
+                sync_item and sync_item.created_by_sync
+            ):
                 return False
         elif item.media_type == MediaTypes.TV.value:
-            if TV.objects.filter(user=self.user, item=item).count() != 1:
+            if tracker_count is None:
+                tracker_count = TV.objects.filter(user=self.user, item=item).count()
+            if tracker_count != 1:
                 return False
-            if Episode.all_objects.filter(
-                related_season__related_tv=media_obj
-            ).exists():
+            if has_watch_history is None:
+                has_watch_history = Episode.all_objects.filter(
+                    related_season__related_tv=media_obj
+                ).exists()
+            if has_watch_history:
                 return False
-            if media_obj.end_date is not None and not sync_item.created_by_sync:
+            if media_obj.end_date is not None and not (
+                sync_item and sync_item.created_by_sync
+            ):
                 return False
         else:
             return False

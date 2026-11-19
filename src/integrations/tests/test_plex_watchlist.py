@@ -8,7 +8,9 @@ from django.urls import reverse
 from django.utils import timezone
 from django_celery_beat.models import IntervalSchedule, PeriodicTask
 
+from app.mixins import disable_fetch_releases
 from app.models import (
+    TV,
     Episode,
     Item,
     ItemTag,
@@ -18,7 +20,6 @@ from app.models import (
     Season,
     Sources,
     Status,
-    TV,
     Tag,
 )
 from integrations import plex as plex_api
@@ -177,7 +178,9 @@ class PlexWatchlistSyncServiceTests(TestCase):
         tag = Tag.objects.create(user=self.user, name="Watch later")
         self.user.watchlist_import_status = Status.COMPLETED.value
         self.user.watchlist_import_tag = tag
-        self.user.save(update_fields=["watchlist_import_status", "watchlist_import_tag"])
+        self.user.save(
+            update_fields=["watchlist_import_status", "watchlist_import_tag"]
+        )
         mock_fetch.return_value = ([self._movie_entry()], 1)
         mock_metadata.side_effect = self._metadata_side_effect
         PlexWatchlistSyncService(self.user, self.account).sync()
@@ -266,6 +269,91 @@ class PlexWatchlistSyncServiceTests(TestCase):
         self.assertEqual(counts.get("linked_existing", 0), 1)
         self.assertFalse(sync_item.created_by_sync)
         self.assertTrue(sync_item.is_active)
+
+    @patch("integrations.plex_watchlist.plex_api.fetch_watchlist")
+    def test_cleanup_removes_unlinked_unwatched_trackers(self, mock_fetch_watchlist):
+        movie_item = Item.objects.create(
+            media_id="901",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.MOVIE.value,
+            title="Unwatchlisted Movie",
+        )
+        show_item = Item.objects.create(
+            media_id="902",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.TV.value,
+            title="Unwatchlisted Show",
+        )
+        with disable_fetch_releases():
+            Movie.objects.create(
+                user=self.user,
+                item=movie_item,
+                status=Status.PLANNING.value,
+            )
+            TV.objects.create(
+                user=self.user,
+                item=show_item,
+                status=Status.IN_PROGRESS.value,
+            )
+        mock_fetch_watchlist.return_value = ([], 0)
+
+        counts, warnings = PlexWatchlistSyncService(self.user, self.account).sync()
+
+        self.assertEqual(warnings, "")
+        self.assertEqual(Movie.objects.filter(user=self.user).count(), 0)
+        self.assertEqual(TV.objects.filter(user=self.user).count(), 0)
+        self.assertEqual(counts.get("removed", 0), 2)
+
+    @patch("integrations.plex_watchlist.plex_api.fetch_watchlist")
+    def test_cleanup_preserves_unlinked_movie_with_play_history(
+        self, mock_fetch_watchlist
+    ):
+        item = Item.objects.create(
+            media_id="903",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.MOVIE.value,
+            title="Watched Movie",
+        )
+        with disable_fetch_releases():
+            movie = Movie.objects.create(
+                user=self.user,
+                item=item,
+                status=Status.PLANNING.value,
+            )
+        MoviePlay.objects.create(movie=movie, end_date=timezone.now())
+        mock_fetch_watchlist.return_value = ([], 0)
+
+        counts, _ = PlexWatchlistSyncService(self.user, self.account).sync()
+
+        self.assertTrue(Movie.objects.filter(pk=movie.pk).exists())
+        self.assertEqual(counts.get("removed", 0), 0)
+
+    @patch("integrations.plex_watchlist.plex_api.fetch_watchlist")
+    def test_incomplete_watchlist_snapshot_skips_global_cleanup(
+        self, mock_fetch_watchlist
+    ):
+        item = Item.objects.create(
+            media_id="904",
+            source=Sources.TMDB.value,
+            media_type=MediaTypes.MOVIE.value,
+            title="Unwatchlisted Movie",
+        )
+        with disable_fetch_releases():
+            Movie.objects.create(
+                user=self.user,
+                item=item,
+                status=Status.PLANNING.value,
+            )
+        mock_fetch_watchlist.return_value = (
+            [{"type": "movie", "title": "Unmatched Watchlist Movie"}],
+            1,
+        )
+
+        counts, warnings = PlexWatchlistSyncService(self.user, self.account).sync()
+
+        self.assertTrue(Movie.objects.filter(user=self.user, item=item).exists())
+        self.assertEqual(counts.get("removed", 0), 0)
+        self.assertIn("could not be matched safely", warnings)
 
     @patch("integrations.plex_watchlist.services.get_media_metadata")
     @patch("integrations.plex_watchlist.plex_api.fetch_watchlist")
@@ -493,7 +581,9 @@ class PlexWatchlistViewTests(TestCase):
             },
         )
 
-        self.assertRedirects(response, reverse("import_data"), fetch_redirect_response=False)
+        self.assertRedirects(
+            response, reverse("import_data"), fetch_redirect_response=False
+        )
         mock_delay.assert_called_once_with(user_id=self.user.id, mode="watchlist")
 
         self.user.refresh_from_db()
@@ -529,7 +619,9 @@ class PlexWatchlistViewTests(TestCase):
 
         response = self.client.post(reverse("plex_disable_watchlist"))
 
-        self.assertRedirects(response, reverse("import_data"), fetch_redirect_response=False)
+        self.assertRedirects(
+            response, reverse("import_data"), fetch_redirect_response=False
+        )
         self.account.refresh_from_db()
         self.assertFalse(self.account.watchlist_sync_enabled)
         self.assertFalse(PeriodicTask.objects.filter(task=WATCHLIST_TASK_NAME).exists())
@@ -554,7 +646,9 @@ class PlexWatchlistViewTests(TestCase):
             update_fields=["watchlist_sync_enabled", "watchlist_last_synced_at"],
         )
 
-        response = self.client.get(reverse("provider_detail", args=["plex"]) + "?tab=import")
+        response = self.client.get(
+            reverse("provider_detail", args=["plex"]) + "?tab=import"
+        )
 
         self.assertContains(response, "Import Watchlist Data Only")
         self.assertContains(response, "Disable Watchlist Sync")
@@ -567,7 +661,9 @@ class PlexWatchlistViewTests(TestCase):
     ):
         mock_fetch_account.return_value = {"username": "watchview", "id": "acct-1"}
 
-        response = self.client.get(reverse("provider_detail", args=["plex"]) + "?tab=import")
+        response = self.client.get(
+            reverse("provider_detail", args=["plex"]) + "?tab=import"
+        )
 
         self.assertContains(response, "Recurring sync:")
         self.assertNotContains(response, "Disable Watchlist Sync")
